@@ -17,6 +17,7 @@ limitations under the License.
 package server
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -83,6 +84,7 @@ type handler struct {
 	metrics          metrics
 	ec2Provider      EC2Provider
 	featureGates     featuregate.MutableFeatureGate
+	responseCache    cache.Store
 }
 
 // metrics are handles to the collectors for prometheous for the various metrics we are tracking.
@@ -99,6 +101,12 @@ const (
 	metricUnknown   = "uknown_user"
 	metricSuccess   = "success"
 )
+
+type cacheResponse struct {
+	token string
+	code int
+	body []byte
+}
 
 // New the authentication webhook server.
 func New(
@@ -191,7 +199,22 @@ func (c *Server) getHandler() *handler {
 		metrics:          createMetrics(),
 		ec2Provider:      newEC2Provider(c.ServerEC2DescribeInstancesRoleARN),
 		featureGates:     c.FeatureGates,
+		responseCache:    cache.NewTTLStore(func (o interface{}) (string, error) {
+			return o.(cacheResponse).token, nil
+		}, 15 * time.Minute),
 	}
+
+	// TTLStore is expire-on-read, so we need to try to read all entries
+	// on a periodic basis to remove them from the cache.
+	cleanupTicker := time.NewTicker(5 * time.Minute)
+	go func() {
+		for _ = range cleanupTicker.C {
+			keys := h.responseCache.ListKeys()
+			for _, key := range keys {
+				_, _, _ = h.responseCache.GetByKey(key)
+			}
+		}
+	}()
 
 	for _, m := range c.RoleMappings {
 		canonicalizedARN, err := arn.Canonicalize(strings.ToLower(m.RoleARN))
@@ -270,6 +293,26 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 	// all responses from here down have JSON bodies
 	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 
+	// Interrogate the auth cache
+	cr, cacheExists, err := h.responseCache.GetByKey(tokenReview.Spec.Token)
+	if cacheExists && err == nil {
+		crResponse := cr.(cacheResponse)
+		w.WriteHeader(crResponse.code)
+		w.Write(crResponse.body)
+		return
+	}
+
+	denyHandler := func() {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write(tokenReviewDenyJSON)
+		h.responseCache.Add(cacheResponse{
+			token: tokenReview.Spec.Token,
+			code:  http.StatusForbidden,
+			body:  tokenReviewDenyJSON,
+		})
+
+	}
+
 	// if the token is invalid, reject with a 403
 	identity, err := h.verifier.Verify(tokenReview.Spec.Token)
 	if err != nil {
@@ -279,8 +322,7 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 			h.metrics.latency.WithLabelValues(metricInvalid).Observe(duration(start))
 		}
 		log.WithError(err).Warn("access denied")
-		w.WriteHeader(http.StatusForbidden)
-		w.Write(tokenReviewDenyJSON)
+		denyHandler()
 		return
 	}
 
@@ -298,8 +340,7 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 	if err != nil {
 		h.metrics.latency.WithLabelValues(metricUnknown).Observe(duration(start))
 		log.WithError(err).Warn("access denied")
-		w.WriteHeader(http.StatusForbidden)
-		w.Write(tokenReviewDenyJSON)
+		denyHandler()
 		return
 	}
 
@@ -314,7 +355,12 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 	}).Info("access granted")
 	h.metrics.latency.WithLabelValues(metricSuccess).Observe(duration(start))
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(authenticationv1beta1.TokenReview{
+	cacheValue := cacheResponse{
+		token: tokenReview.Spec.Token,
+		code:  http.StatusOK,
+	}
+	buf := bytes.NewBuffer(cacheValue.body)
+	json.NewEncoder(buf).Encode(authenticationv1beta1.TokenReview{
 		Status: authenticationv1beta1.TokenReviewStatus{
 			Authenticated: true,
 			User: authenticationv1beta1.UserInfo{
@@ -324,6 +370,9 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 			},
 		},
 	})
+	w.Write(buf.Bytes())
+	h.responseCache.Add(cacheValue)
+	return
 }
 
 func (h *handler) doMapping(identity *token.Identity) (string, []string, error) {
